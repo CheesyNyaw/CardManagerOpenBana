@@ -81,14 +81,30 @@ Module WinSCard
         Dim sendBuf() As Byte = {&HFF, &HCA, &H0, &H0, &H0}
         Dim recvBuf(258) As Byte
         Dim recvLen As UInteger = 259
+
         Dim sendPci As SCARD_IO_REQUEST
         Dim recvPci As SCARD_IO_REQUEST
+
+        ' Force pciLength to 8 — some ACR122U firmware ignores the Marshal size
         sendPci.dwProtocol = protocol
-        sendPci.cbPciLength = CUInt(Marshal.SizeOf(sendPci))
-        Dim rv As Integer = SCardTransmit(hCard, sendPci, sendBuf, CUInt(sendBuf.Length), recvPci, recvBuf, recvLen)
-        If rv <> SCARD_S_SUCCESS OrElse recvLen < 3 Then Return Nothing
+        sendPci.cbPciLength = 8
+        recvPci.dwProtocol = 0
+        recvPci.cbPciLength = 8
+
+        Dim rv As Integer = SCardTransmit(
+        hCard, sendPci,
+        sendBuf, CUInt(sendBuf.Length),
+        recvPci, recvBuf, recvLen)
+
+        If rv <> SCARD_S_SUCCESS Then Return Nothing
+
+        ' Check SW1/SW2 — last two bytes must be 90 00 (success)
+        If recvLen < 3 Then Return Nothing
+        Dim sw1 As Byte = recvBuf(CInt(recvLen) - 2)
+        Dim sw2 As Byte = recvBuf(CInt(recvLen) - 1)
+        If sw1 <> &H90 OrElse sw2 <> &H0 Then Return Nothing
+
         Dim uidLen As Integer = CInt(recvLen) - 2
-        If uidLen <= 0 Then Return Nothing
         Dim sb As New StringBuilder()
         For i As Integer = 0 To uidLen - 1
             sb.Append(recvBuf(i).ToString("X2"))
@@ -572,6 +588,7 @@ Public Class MainForm
             SetNfcStatus("⚠  PC/SC context failed (0x" & rv.ToString("X8") & ")")
             Return
         End If
+
         While _nfcRunning
             Dim readers As List(Of String) = WinSCard.ListReaders(_scContext)
             If readers.Count = 0 Then
@@ -579,44 +596,114 @@ Public Class MainForm
                 Thread.Sleep(2000)
                 Continue While
             End If
+
             SetNfcStatus("⦿  Reader: " & readers(0))
+
+            ' Build state array with UNAWARE so we get the current state immediately
             Dim states(readers.Count - 1) As WinSCard.SCARD_READERSTATE
             For i As Integer = 0 To readers.Count - 1
                 states(i).szReader = readers(i)
-                states(i).dwCurrentState = WinSCard.SCARD_STATE_PRESENT
+                states(i).dwCurrentState = 0  ' SCARD_STATE_UNAWARE — let PC/SC tell us the real state
             Next
-            rv = WinSCard.SCardGetStatusChange(_scContext, 1500, states, CUInt(states.Length))
-            If rv = WinSCard.SCARD_E_TIMEOUT Then Continue While
-            If rv <> WinSCard.SCARD_S_SUCCESS Then
-                Thread.Sleep(1000)
-                Continue While
-            End If
-            For Each st As WinSCard.SCARD_READERSTATE In states
-                If (st.dwEventState And WinSCard.SCARD_STATE_PRESENT) <> 0 AndAlso
-                   (st.dwEventState And WinSCard.SCARD_STATE_CHANGED) <> 0 Then
-                    Dim uid As String = ReadCardUID(st.szReader)
-                    If uid IsNot Nothing Then OnNfcCardTapped(uid)
+
+            ' Initial call to get current state
+            rv = WinSCard.SCardGetStatusChange(_scContext, 0, states, CUInt(states.Length))
+
+            ' Now update currentState to eventState so next call detects CHANGES
+            For i As Integer = 0 To states.Length - 1
+                states(i).dwCurrentState = states(i).dwEventState
+            Next
+
+            ' Main loop — wait for state changes
+            While _nfcRunning
+                rv = WinSCard.SCardGetStatusChange(_scContext, 1500, states, CUInt(states.Length))
+
+                If rv = WinSCard.SCARD_E_TIMEOUT Then
+                    ' No change — check if reader list changed
+                    Dim currentReaders As List(Of String) = WinSCard.ListReaders(_scContext)
+                    If currentReaders.Count <> readers.Count Then Exit While  ' Re-enumerate
+                    Continue While
                 End If
-            Next
+
+                If rv <> WinSCard.SCARD_S_SUCCESS Then
+                    Thread.Sleep(500)
+                    Exit While  ' Re-enumerate readers
+                End If
+
+                For i As Integer = 0 To states.Length - 1
+                    Dim eventState As UInteger = states(i).dwEventState
+
+                    ' Card just arrived
+                    If (eventState And WinSCard.SCARD_STATE_PRESENT) <> 0 AndAlso
+                   (eventState And WinSCard.SCARD_STATE_CHANGED) <> 0 AndAlso
+                   (states(i).dwCurrentState And WinSCard.SCARD_STATE_PRESENT) = 0 Then
+
+                        Dim uid As String = ReadCardUID(states(i).szReader)
+                        If uid IsNot Nothing Then
+                            OnNfcCardTapped(uid)
+                        Else
+                            SetStatus("Card detected but could not read UID.")
+                        End If
+                    End If
+
+                    ' Update current state for next iteration
+                    states(i).dwCurrentState = eventState And Not WinSCard.SCARD_STATE_CHANGED
+                Next
+            End While
         End While
+
         WinSCard.SCardReleaseContext(_scContext)
     End Sub
 
     Private Function ReadCardUID(readerName As String) As String
+        ' Strategy 1: T=1
+        Dim uid As String = TryReadUID(readerName, WinSCard.SCARD_PROTOCOL_T1)
+        If uid IsNot Nothing Then Return uid
+
+        ' Strategy 2: T=0
+        uid = TryReadUID(readerName, WinSCard.SCARD_PROTOCOL_T0)
+        If uid IsNot Nothing Then Return uid
+
+        ' Strategy 3: T=0 or T=1 combined
+        uid = TryReadUID(readerName, WinSCard.SCARD_PROTOCOL_T0 Or WinSCard.SCARD_PROTOCOL_T1)
+        If uid IsNot Nothing Then Return uid
+
+        ' Strategy 4: Undefined protocol (some ACR122U firmware needs this for NTAG)
+        uid = TryReadUID(readerName, WinSCard.SCARD_PROTOCOL_UNDEFINED)
+        If uid IsNot Nothing Then Return uid
+
+        Return Nothing
+    End Function
+
+    Private Function TryReadUID(readerName As String, protocol As UInteger) As String
         Dim hCard As IntPtr = IntPtr.Zero
-        Dim protocol As UInteger = 0
-        Dim rv As Integer = WinSCard.SCardConnect(_scContext, readerName,
-                                                   WinSCard.SCARD_SHARE_SHARED,
-                                                   WinSCard.SCARD_PROTOCOL_T0 Or WinSCard.SCARD_PROTOCOL_T1,
-                                                   hCard, protocol)
-        If rv <> WinSCard.SCARD_S_SUCCESS Then
-            protocol = WinSCard.SCARD_PROTOCOL_UNDEFINED
-            rv = WinSCard.SCardConnect(_scContext, readerName, WinSCard.SCARD_SHARE_SHARED,
-                                       WinSCard.SCARD_PROTOCOL_UNDEFINED, hCard, protocol)
-        End If
+        Dim activeProtocol As UInteger = 0
+
+        Dim rv As Integer = WinSCard.SCardConnect(
+        _scContext, readerName,
+        WinSCard.SCARD_SHARE_SHARED,
+        protocol,
+        hCard, activeProtocol)
+
         If rv <> WinSCard.SCARD_S_SUCCESS Then Return Nothing
+
         Try
-            Return WinSCard.GetCardUID(hCard, protocol)
+            ' Try GET UID APDU (FF CA 00 00 00)
+            Dim uid As String = WinSCard.GetCardUID(hCard, activeProtocol)
+            If uid IsNot Nothing Then Return uid
+
+            ' Fallback: try with the originally requested protocol instead of negotiated one
+            If activeProtocol <> protocol Then
+                uid = WinSCard.GetCardUID(hCard, protocol)
+                If uid IsNot Nothing Then Return uid
+            End If
+
+            ' Last resort: try with protocol 0 (raw)
+            uid = WinSCard.GetCardUID(hCard, 0)
+            Return uid
+
+        Catch ex As Exception
+            Return Nothing
         Finally
             WinSCard.SCardDisconnect(hCard, WinSCard.SCARD_LEAVE_CARD)
         End Try
